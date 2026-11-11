@@ -146,6 +146,17 @@ pub struct Connection<State> {
 
     _state: PhantomData<State>,
 }
+impl<State> Connection<State> {
+    /// Reads exactly `len` bytes into `offset` of the connection buffer.
+    async fn read_exact_at(&mut self, offset: usize, len: usize) -> Result<(), Error> {
+        self.stream
+            .read_exact(&mut self.buf[offset..offset + len])
+            .await?;
+
+        Ok(())
+    }
+}
+
 impl Connection<Initial> {
     pub fn new(
         stream: TcpStream,
@@ -159,7 +170,7 @@ impl Connection<Initial> {
             client_addr,
             resolver,
             timeout,
-            buf: Box::new([0; crate::MAX_PACKET_SIZE]),
+            buf: vec![0; crate::MAX_PACKET_SIZE].into_boxed_slice(),
             user_pass,
             _state: PhantomData,
         }
@@ -167,35 +178,44 @@ impl Connection<Initial> {
 
     /// Authorizes with the client and checks version.
     pub async fn init_conn(mut self) -> Result<Connection<Authorized>, Error> {
-        let input = self.stream.read(&mut self.buf).await?;
-        let input = Input::from(&self.buf[..input]);
+        // A single `read` is not guaranteed to return a whole packet, so read
+        // exactly as many bytes as the packet header announces.
+        self.read_exact_at(0, 2).await?;
+        let num_methods = self.buf[1] as usize;
+        self.read_exact_at(2, num_methods).await?;
 
+        let input = Input::from(&self.buf[..2 + num_methods]);
         let method = Self::parse_initial_packet(input, self.user_pass.is_some())?;
 
         self.stream
             .write_all(&[SOCKS_VERSION, method as u8])
             .await?;
-        self.stream.flush().await?;
 
         if method == AuthMethod::NoneAcceptable {
             tracing::warn!("no acceptable auth method found");
             return Err(Error::AuthMethodNotFound);
         }
 
-        if let Some(user_pass) = self.user_pass.as_ref() {
-            let input = self.stream.read(&mut self.buf).await?;
-            let input = Input::from(&self.buf[..input]);
+        if let Some(user_pass) = self.user_pass.clone() {
+            // VER, ULEN, UNAME
+            self.read_exact_at(0, 2).await?;
+            let uname_len = self.buf[1] as usize;
+            self.read_exact_at(2, uname_len).await?;
+
+            // PLEN, PASSWD
+            self.read_exact_at(2 + uname_len, 1).await?;
+            let pass_len = self.buf[2 + uname_len] as usize;
+            self.read_exact_at(3 + uname_len, pass_len).await?;
+
+            let len = 3 + uname_len + pass_len;
+            let input = Input::from(&self.buf[..len]);
             let (username, password) = Self::parse_username_password_request(input)?;
 
-            let status = u8::from(
-                !(username == user_pass.username.as_bytes()
-                    || password == user_pass.password.as_bytes()),
-            );
+            let status = u8::from(!credentials_valid(username, password, &user_pass));
 
             self.stream
                 .write_all(&[USERNAME_PASSWORD_VERSION, status])
                 .await?;
-            self.stream.flush().await?;
 
             if status != 0x00 {
                 tracing::warn!("invalid credentials");
@@ -259,8 +279,28 @@ impl Connection<Initial> {
 
 impl Connection<Authorized> {
     pub async fn handle_request(mut self) -> Result<(SocketAddr, Connection<Piping>), Error> {
-        let input = self.stream.read(&mut self.buf).await?;
-        let input = Input::from(&self.buf[..input]);
+        // VER, CMD, RSV, ATYP
+        self.read_exact_at(0, 4).await?;
+
+        let total = match AddressType::from_repr(self.buf[3]).ok_or(Error::InvalidAddressType)? {
+            AddressType::Ipv4 => {
+                self.read_exact_at(4, 4 + 2).await?;
+                4 + 4 + 2
+            }
+            AddressType::Ipv6 => {
+                self.read_exact_at(4, 16 + 2).await?;
+                4 + 16 + 2
+            }
+            AddressType::DomainName => {
+                self.read_exact_at(4, 1).await?;
+                let domain_len = self.buf[4] as usize;
+                self.read_exact_at(5, domain_len + 2).await?;
+
+                5 + domain_len + 2
+            }
+        };
+
+        let input = Input::from(&self.buf[..total]);
 
         let mut domain_buf = [0; u8::MAX as usize]; // max domain length for socks5 is the size of a byte
         let command = Self::parse_request(&mut domain_buf, input)?;
@@ -287,11 +327,13 @@ impl Connection<Authorized> {
 
         let piping = match command.ty {
             CommandType::Connect => self.handle_connect(dest_sock_addr).await?,
-            CommandType::Bind => {
-                todo!()
-            }
-            CommandType::UdpAssociate => {
-                todo!()
+            // Unsupported commands must be answered, not panic the server.
+            CommandType::Bind | CommandType::UdpAssociate => {
+                let (reply_buf, reply_buf_len) =
+                    Reply::new(0x07, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
+                self.stream.write_all(&reply_buf[..reply_buf_len]).await?;
+
+                return Err(Error::InvalidCommandType);
             }
         };
 
@@ -381,6 +423,12 @@ impl Connection<Authorized> {
     }
 }
 
+/// Both parts of the credentials have to match; accepting either one would
+/// let anyone in with half of the pair.
+fn credentials_valid(username: &[u8], password: &[u8], expected: &crate::UserPass) -> bool {
+    username == expected.username.as_bytes() && password == expected.password.as_bytes()
+}
+
 fn change_state<O, N>(old: Connection<O>) -> Connection<N> {
     Connection {
         stream: old.stream,
@@ -390,5 +438,249 @@ fn change_state<O, N>(old: Connection<O>) -> Connection<N> {
         buf: old.buf,
         user_pass: old.user_pass,
         _state: PhantomData,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+    use std::net::Ipv4Addr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn resolver() -> TokioAsyncResolver {
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+    }
+
+    fn user_pass(username: &str, password: &str) -> crate::UserPass {
+        crate::UserPass {
+            username: username.to_owned(),
+            password: password.to_owned(),
+        }
+    }
+
+    async fn accept_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, client) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+
+        (server.unwrap().0, client.unwrap())
+    }
+
+    fn connection(server: TcpStream, user_pass: Option<crate::UserPass>) -> Connection<Initial> {
+        Connection::new(
+            server,
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            resolver(),
+            Duration::from_secs(5),
+            user_pass,
+        )
+    }
+
+    #[test]
+    fn credentials_require_both_username_and_password() {
+        let expected = user_pass("user", "pass");
+
+        assert!(credentials_valid(b"user", b"pass", &expected));
+        assert!(!credentials_valid(b"user", b"wrong", &expected));
+        assert!(!credentials_valid(b"wrong", b"pass", &expected));
+        assert!(!credentials_valid(b"", b"", &expected));
+    }
+
+    #[test]
+    fn auth_method_is_negotiated_against_the_server_config() {
+        // Offers no-auth and username/password.
+        let greeting = [SOCKS_VERSION, 0x02, 0x00, 0x02];
+        assert_eq!(
+            Connection::<Initial>::parse_initial_packet(Input::from(&greeting), false).unwrap(),
+            AuthMethod::NoAuthRequired
+        );
+        assert_eq!(
+            Connection::<Initial>::parse_initial_packet(Input::from(&greeting), true).unwrap(),
+            AuthMethod::UsernamePassword
+        );
+
+        // A client that only offers GSSAPI must not be let in.
+        let gssapi_only = [SOCKS_VERSION, 0x01, 0x01];
+        assert_eq!(
+            Connection::<Initial>::parse_initial_packet(Input::from(&gssapi_only), true).unwrap(),
+            AuthMethod::NoneAcceptable
+        );
+
+        let wrong_version = [0x04, 0x01, 0x00];
+        assert!(matches!(
+            Connection::<Initial>::parse_initial_packet(Input::from(&wrong_version), false),
+            Err(Error::InvalidVersion)
+        ));
+    }
+
+    #[tokio::test]
+    async fn authenticates_with_fragmented_username_password() {
+        let (server, mut client) = accept_pair().await;
+
+        let task = tokio::spawn(connection(server, Some(user_pass("user", "pass"))).init_conn());
+
+        // Greeting arrives one byte at a time; a single `read` would parse garbage.
+        client.write_all(&[SOCKS_VERSION]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client
+            .write_all(&[0x01, AuthMethod::UsernamePassword as u8])
+            .await
+            .unwrap();
+
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [SOCKS_VERSION, AuthMethod::UsernamePassword as u8]);
+
+        // Authentication request arrives in two pieces as well.
+        client
+            .write_all(&[USERNAME_PASSWORD_VERSION, 4, b'u', b's', b'e', b'r'])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client
+            .write_all(&[4, b'p', b'a', b's', b's'])
+            .await
+            .unwrap();
+
+        let mut status = [0; 2];
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [USERNAME_PASSWORD_VERSION, 0x00]);
+
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_correct_username_with_wrong_password() {
+        let (server, mut client) = accept_pair().await;
+
+        let task = tokio::spawn(connection(server, Some(user_pass("user", "pass"))).init_conn());
+
+        client
+            .write_all(&[SOCKS_VERSION, 0x01, AuthMethod::UsernamePassword as u8])
+            .await
+            .unwrap();
+
+        let mut reply = [0; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [SOCKS_VERSION, AuthMethod::UsernamePassword as u8]);
+
+        client
+            .write_all(&[
+                USERNAME_PASSWORD_VERSION,
+                4,
+                b'u',
+                b's',
+                b'e',
+                b'r',
+                3,
+                b'b',
+                b'a',
+                b'd',
+            ])
+            .await
+            .unwrap();
+
+        let mut status = [0; 2];
+        client.read_exact(&mut status).await.unwrap();
+        assert_eq!(status, [USERNAME_PASSWORD_VERSION, 0x01]);
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Error::InvalidCredentials)
+        ));
+    }
+
+    #[test]
+    fn parses_connect_requests() {
+        let mut domain_buf = [0; u8::MAX as usize];
+
+        let ipv4 = [0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90];
+        let command =
+            Connection::<Authorized>::parse_request(&mut domain_buf, Input::from(&ipv4)).unwrap();
+        assert_eq!(command.version, SOCKS_VERSION);
+        assert_eq!(command.ty, CommandType::Connect);
+        assert_eq!(
+            command.addr,
+            Address::Ipv4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
+        );
+
+        let ipv6 = [
+            0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x50,
+        ];
+        let command =
+            Connection::<Authorized>::parse_request(&mut domain_buf, Input::from(&ipv6)).unwrap();
+        assert_eq!(
+            command.addr,
+            Address::Ipv6(SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 80, 0, 0))
+        );
+
+        let mut domain = vec![0x05, 0x01, 0x00, 0x03, 11];
+        domain.extend_from_slice(b"example.com");
+        domain.extend_from_slice(&80u16.to_be_bytes());
+        let command =
+            Connection::<Authorized>::parse_request(&mut domain_buf, Input::from(&domain)).unwrap();
+        assert_eq!(command.addr, Address::DomainName("example.com", 80));
+
+        let unknown_address = [0x05, 0x01, 0x00, 0x09];
+        assert!(matches!(
+            Connection::<Authorized>::parse_request(&mut domain_buf, Input::from(&unknown_address)),
+            Err(Error::InvalidAddressType)
+        ));
+    }
+
+    #[tokio::test]
+    async fn replies_to_connect_and_rejects_bind() {
+        let (server, mut client) = accept_pair().await;
+        let task =
+            tokio::spawn(change_state::<_, Authorized>(connection(server, None)).handle_request());
+
+        client
+            .write_all(&[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x1F, 0x90])
+            .await
+            .unwrap();
+
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..4], &[SOCKS_VERSION, 0x00, 0x00, 0x01]);
+
+        let (addr, _pipe) = task.await.unwrap().unwrap();
+        assert_eq!(addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 8080)));
+
+        let (server, mut client) = accept_pair().await;
+        let task =
+            tokio::spawn(change_state::<_, Authorized>(connection(server, None)).handle_request());
+
+        // BIND used to `todo!()`, which killed the whole server.
+        client
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0x00, 0x00])
+            .await
+            .unwrap();
+
+        let mut reply = [0; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x07);
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Error::InvalidCommandType)
+        ));
+    }
+
+    #[test]
+    fn reply_round_trips_both_address_families() {
+        let (buf, len) = Reply::new(0x00, SocketAddr::from((Ipv4Addr::LOCALHOST, 1080))).to_bytes();
+        assert_eq!(len, 10);
+        assert_eq!(&buf[..4], &[0x05, 0x00, 0x00, 0x01]);
+        assert_eq!(&buf[4..8], &Ipv4Addr::LOCALHOST.octets());
+        assert_eq!(&buf[8..10], &1080u16.to_be_bytes());
+
+        let (buf, len) =
+            Reply::new(0x05, SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 80))).to_bytes();
+        assert_eq!(len, 22);
+        assert_eq!(buf[3], 0x04);
+        assert_eq!(&buf[len - 2..len], &[0x00, 0x50]);
     }
 }

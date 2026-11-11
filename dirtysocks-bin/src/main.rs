@@ -10,7 +10,7 @@ use boringtun::{
 };
 use dirtysocks::ServerOptions;
 use hickory_resolver::{
-    config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts},
+    config::{ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
 };
 use tokio::net::TcpListener;
@@ -39,8 +39,6 @@ async fn main() -> Result<()> {
     let conf = tokio::fs::read_to_string(args.config).await?;
 
     let conf: conf::Conf = conf::Conf::from_str(&conf)?;
-
-    dbg!(&conf);
 
     let [peer] = &conf.peers[..] else {
         panic!("only one peer is allowed")

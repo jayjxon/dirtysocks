@@ -1,5 +1,5 @@
 use base64::Engine;
-use color_eyre::eyre::{ContextCompat, Result};
+use color_eyre::eyre::{eyre, ContextCompat, Result};
 use std::{net::IpAddr, str::FromStr};
 
 use smoltcp::wire::IpCidr;
@@ -45,8 +45,16 @@ impl Conf {
         let dns = interface.get("DNS").context(n!("DNS"))?.parse()?;
         let mtu = interface
             .get("MTU")
-            .and_then(|mtu| mtu.parse().ok())
+            .map(str::parse::<usize>)
+            .transpose()?
             .unwrap_or(1280);
+
+        if !(576..=dirtysocks::MAX_PACKET_SIZE).contains(&mtu) {
+            return Err(eyre!(
+                "MTU must be between 576 and {} (got {mtu})",
+                dirtysocks::MAX_PACKET_SIZE
+            ));
+        }
 
         let interface = Interface {
             private_key,
@@ -66,8 +74,11 @@ impl Conf {
                 let (host, port) = peer
                     .get("Endpoint")
                     .context(n!("Endpoint"))?
-                    .split_once(':')
+                    .rsplit_once(':')
                     .context("invalid endpoint format")?;
+
+                // Allow IPv6 endpoints such as `[::1]:51820`.
+                let host = host.trim_start_matches('[').trim_end_matches(']');
 
                 let port = port.parse()?;
 
@@ -85,6 +96,13 @@ impl Conf {
 
 fn decode_key(encoded_key: &str) -> Result<[u8; 32]> {
     let mut key = [0; 32];
-    base64::engine::general_purpose::STANDARD.decode_slice(encoded_key, &mut key)?;
+    let len = base64::engine::general_purpose::STANDARD.decode_slice(encoded_key, &mut key)?;
+
+    // `decode_slice` silently succeeds with a short key, leaving a partially
+    // zeroed key behind; reject anything that isn't a full key.
+    if len != key.len() {
+        return Err(eyre!("expected a 32 byte key, got {len} bytes"));
+    }
+
     Ok(key)
 }

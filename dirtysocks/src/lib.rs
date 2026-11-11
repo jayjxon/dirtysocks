@@ -7,11 +7,7 @@
 )]
 
 use boringtun::noise::Tunn;
-use futures_util::{
-    future::{join_all, Either},
-    stream::FuturesUnordered,
-    FutureExt, StreamExt,
-};
+use futures_util::{future::Either, stream::FuturesUnordered, StreamExt};
 use handler::{Connection, Initial};
 use hickory_resolver::{
     config::{ResolverConfig, ResolverOpts},
@@ -50,6 +46,20 @@ use wg::Peer;
 pub mod handler;
 
 pub const MAX_PACKET_SIZE: usize = 65535;
+
+/// Maximum amount of data pulled out of a `smoltcp` socket in one go.
+const MAX_SOCKET_CHUNK: usize = 16 * 1024;
+/// Maximum amount of data coalesced into a single write to a client.
+const MAX_WRITE_CHUNK: usize = 64 * 1024;
+/// Number of messages handled from the interface channel at once.
+const MSG_BATCH: usize = 128;
+/// Number of messages forwarded from the interface to a client at once.
+const CLIENT_BATCH: usize = 32;
+/// Upper bound on data buffered inside the interface for one connection.
+/// Beyond this the connection is aborted instead of growing without bound.
+const MAX_QUEUED_WRITES: usize = 64;
+/// Smallest delay between interface polls, to avoid burning CPU on a busy loop.
+const MIN_POLL_WAIT: StdDuration = StdDuration::from_millis(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -174,7 +184,7 @@ impl Server {
 
         iface.update_ip_addrs(|ip_addrs| *ip_addrs = opts.iface_addrs);
 
-        let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(128);
+        let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(MSG_BATCH);
 
         let this = Self {
             listener: opts.listener,
@@ -183,8 +193,9 @@ impl Server {
                 iface,
                 socket_set: SocketSet::new(Vec::new()),
                 peer,
-                next_ephemeral_port: NonZeroU16::new(1).unwrap(),
+                next_ephemeral_port: NonZeroU16::new(1024).unwrap(),
                 sockets_ctx: HashMap::new(),
+                closed_sockets: Vec::new(),
                 last_iface_poll: StdInstant::now(),
                 iface_poll_delay: None,
             }),
@@ -192,7 +203,7 @@ impl Server {
             resolver: opts.resolver,
             timeout: opts.timeout,
             user_pass: opts.user_pass,
-            next_ephemeral_port: 1,
+            next_ephemeral_port: 1024,
         };
 
         this.listen_().await
@@ -215,7 +226,14 @@ impl Server {
             tokio::select! {
                 biased;
 
-                Ok((stream, client_addr)) = self.listener.accept() => {
+                res = self.listener.accept() => {
+                    let (stream, client_addr) = res?;
+
+                    // Forwarding is latency sensitive; don't let Nagle delay small writes.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!(?e, "failed to set TCP_NODELAY on client socket");
+                    }
+
                     piping.push(Self::handle_conn(
                         self.socket_tx.clone(),
                         Connection::new(
@@ -224,13 +242,14 @@ impl Server {
                             self.resolver.clone(),
                             self.timeout,
                             self.user_pass.clone()
-                        )
+                        ),
+                        self.timeout,
                     ));
                 }
 
                 Some(conn) = piping.next() => {
                     if let Err(e) = conn {
-                        tracing::warn!(?e, "error in piping connection");
+                        tracing::debug!(?e, "error in piping connection");
                     }
                 }
             }
@@ -238,84 +257,90 @@ impl Server {
     }
 
     #[instrument(skip(sender, conn))]
-    async fn handle_conn(sender: Sender<ToWgMsg>, conn: Connection<Initial>) -> Result<(), Error> {
-        let (socket_tx, mut socket_rx) = tokio::sync::mpsc::channel(128);
-
-        let (socket_addr, mut pipe) = conn.init_conn().await?.handle_request().await?;
+    async fn handle_conn(
+        sender: Sender<ToWgMsg>,
+        conn: Connection<Initial>,
+        timeout: StdDuration,
+    ) -> Result<(), Error> {
+        // The handshake is client controlled, so it must not be allowed to hang
+        // around forever holding resources.
+        let handshake = async {
+            let (addr, pipe) = conn.init_conn().await?.handle_request().await?;
+            Ok::<_, Error>((addr, pipe))
+        };
+        let (socket_addr, mut pipe) = tokio::time::timeout(timeout, handshake).await??;
 
         tracing::trace!(?socket_addr, "connected to remote");
 
-        if sender
+        let (socket_tx, mut socket_rx) = tokio::sync::mpsc::channel(CLIENT_BATCH);
+
+        sender
             .send(ToWgMsg::Connect(socket_addr, socket_tx))
             .await
-            .is_err()
-        {
-            tracing::error!("error sending connect message to iface");
-            return Err(Error::SendError);
-        };
+            .map_err(|_| Error::SendError)?;
 
-        match socket_rx.recv().await {
-            Some(FromWgMsg::Connect(handle)) => {
-                tracing::trace!(handle = ?handle, "allocated handle");
-            }
-            Some(FromWgMsg::Close) => {
-                tracing::warn!("spurious close message");
+        let handle = match socket_rx.recv().await {
+            Some(FromWgMsg::Connect(handle)) => handle,
+            Some(FromWgMsg::Close) | None => {
+                tracing::trace!(?socket_addr, "iface could not open connection");
+                pipe.stream.shutdown().await?;
                 return Ok(());
             }
-            _ => {
-                return Err(Error::SendError);
-            }
-        }
-
-        let Some(FromWgMsg::Connect(handle)) = socket_rx.recv().await else {
-            return Err(Error::SendError);
+            Some(FromWgMsg::Data(_)) => return Err(Error::SendError),
         };
 
-        tracing::trace!(handle = ?handle, "allocated handle");
+        tracing::trace!(?handle, "allocated handle");
 
-        let mut recvd_len = 0;
-        let mut flush_next = None;
-
-        let mut chunks = VecDeque::with_capacity(64);
+        let mut chunks: Vec<FromWgMsg> = Vec::with_capacity(CLIENT_BATCH);
+        let mut io_buf: Vec<u8> = Vec::with_capacity(MAX_WRITE_CHUNK);
 
         loop {
             tokio::select! {
-                Some(msg) = socket_rx.recv() => {
-                    match msg {
-                        FromWgMsg::Data(data) => {
-                            tracing::trace!(data_len = data.len(), "sending data to remote");
+                n = socket_rx.recv_many(&mut chunks, CLIENT_BATCH) => {
+                    // The iface drops the sender once the remote end is gone.
+                    if n == 0 {
+                        tracing::trace!(?handle, "iface closed the connection");
+                        break;
+                    }
 
-                            recvd_len += data.len();
-                            chunks.push_front(data);
+                    io_buf.clear();
+                    let mut closed = false;
 
-                            if recvd_len >= 32 * 1024 {
-                                tracing::trace!("flushing buf");
+                    #[allow(clippy::iter_with_drain)] // keep the allocation around
+                    for msg in chunks.drain(..) {
+                        match msg {
+                            FromWgMsg::Data(data) => {
+                                io_buf.extend_from_slice(&data);
 
-                                while let Some(chunk) = chunks.pop_back() {
-                                    pipe.stream.write_all(&chunk).await?;
+                                if io_buf.len() >= MAX_WRITE_CHUNK {
+                                    pipe.stream.write_all(&io_buf).await?;
+                                    io_buf.clear();
                                 }
-                                recvd_len = 0;
-                                flush_next = None;
-                            } else {
-                                flush_next = Some(TokioInstant::now() + StdDuration::from_millis(100));
                             }
-                        },
-                        FromWgMsg::Close => break,
-                        FromWgMsg::Connect(_) => {
-                            tracing::warn!("spurious connect message");
-                        },
+                            FromWgMsg::Close => {
+                                closed = true;
+                                break;
+                            }
+                            FromWgMsg::Connect(_) => {
+                                tracing::warn!("spurious connect message");
+                            }
+                        }
+                    }
+
+                    if !io_buf.is_empty() {
+                        pipe.stream.write_all(&io_buf).await?;
+                    }
+
+                    if closed {
+                        break;
                     }
                 }
                 read = pipe.stream.read(&mut pipe.buf) => {
-                    let Ok(read) = read else {
-                        tracing::warn!("error reading from stream");
-                        break;
-                    };
+                    let read = read?;
 
                     tracing::trace!(read, "read data from stream");
 
                     if read == 0 {
-                        tracing::info!("stream closed");
                         break;
                     }
 
@@ -327,21 +352,9 @@ impl Server {
                     )
                     .await
                     .is_err() {
-                        tracing::error!("error sending data to iface");
+                        tracing::debug!("error sending data to iface");
                         break;
                     };
-                }
-                () = flush_next.map_or_else(
-                    || Either::Left(std::future::pending()),
-                    |next| Either::Right(tokio::time::sleep_until(next))
-                ) => {
-                    tracing::warn!("flushing buffer");
-
-                    while let Some(chunk) = chunks.pop_back() {
-                        pipe.stream.write_all(&chunk).await?;
-                    }
-                    recvd_len = 0;
-                    flush_next = None;
                 }
             }
         }
@@ -355,7 +368,7 @@ impl Server {
 
 struct SocketCtx {
     sender: Sender<FromWgMsg>,
-    send_queue: Vec<Box<[u8]>>,
+    send_queue: VecDeque<Box<[u8]>>,
 }
 
 pub struct IfaceHandler {
@@ -364,6 +377,7 @@ pub struct IfaceHandler {
     iface: iface::Interface,
     peer: wg::Peer,
     socket_set: SocketSet<'static>,
+    closed_sockets: Vec<SocketHandle>,
     last_iface_poll: StdInstant,
     iface_poll_delay: Option<SmolDuration>,
     next_ephemeral_port: NonZeroU16,
@@ -371,29 +385,35 @@ pub struct IfaceHandler {
 
 impl IfaceHandler {
     pub async fn handle_iface(mut self) {
-        let mut needs_poll = false;
+        let mut needs_poll = true;
 
         let mut last_device_poll = pin!(tokio::time::sleep(StdDuration::ZERO));
-        let mut device_buf = Box::new([0; MAX_PACKET_SIZE]);
+        let mut device_buf = vec![0; MAX_PACKET_SIZE].into_boxed_slice();
 
-        let mut msg_queue = Vec::with_capacity(self.socket_rx.max_capacity());
+        let mut msg_queue = Vec::with_capacity(MSG_BATCH);
 
         loop {
             while needs_poll || !self.peer.rx_queue.is_empty() {
-                self.poll_iface().await;
+                self.poll_iface();
                 needs_poll = false;
                 self.peer.should_poll = false;
             }
 
             tokio::select! {
-                n = self.socket_rx.recv_many(&mut msg_queue, 128) => {
-                    for msg in msg_queue.drain(..n) {
-                        self.handle_msg(msg).await;
+                n = self.socket_rx.recv_many(&mut msg_queue, MSG_BATCH) => {
+                    if n == 0 {
+                        tracing::debug!("iface channel closed");
+                        return;
+                    }
+
+                    #[allow(clippy::iter_with_drain)] // keep the allocation around
+                    for msg in msg_queue.drain(..) {
+                        self.handle_msg(msg);
                     }
                     needs_poll = true;
                 },
 
-                e = self.peer.poll_device(last_device_poll.as_mut(), &mut *device_buf) => {
+                e = self.peer.poll_device(last_device_poll.as_mut(), &mut device_buf) => {
                     if let Err(e) = e {
                         tracing::warn!(?e, "error polling device");
                     }
@@ -407,114 +427,108 @@ impl IfaceHandler {
         }
     }
 
-    async fn poll_iface(&mut self) {
-        tracing::info!("polling");
-
+    fn poll_iface(&mut self) {
         self.last_iface_poll = StdInstant::now();
         let smoltcp_now = SmolInstant::from(self.last_iface_poll);
 
-        let (delay, processed) = {
-            let processed = self
-                .iface
+        let delay = {
+            self.iface
                 .poll(smoltcp_now, &mut self.peer, &mut self.socket_set);
 
-            let delay = self.iface.poll_delay(smoltcp_now, &self.socket_set);
-
-            (delay, processed)
+            self.iface.poll_delay(smoltcp_now, &self.socket_set)
         };
 
         self.iface_poll_delay = delay;
-
-        if processed {
-            self.poll_sockets().await;
-        }
+        self.poll_sockets();
     }
 
-    async fn poll_sockets(&mut self) {
-        tracing::trace!("polling sockets");
+    /// Moves data between the sockets and their clients.
+    ///
+    /// This never waits on a client: a client that can't keep up must not stall
+    /// the interface, which is shared by every connection.
+    fn poll_sockets(&mut self) {
+        let Self {
+            socket_set,
+            sockets_ctx,
+            closed_sockets,
+            ..
+        } = self;
 
-        let joined = join_all(self.socket_set.iter_mut().map(|(handle, socket)| {
-            Self::poll_socket(
-                handle,
-                tcp::Socket::downcast_mut(socket).unwrap(),
-                self.sockets_ctx.get_mut(&handle).unwrap(),
-            )
-        }));
+        closed_sockets.clear();
 
-        for handle in joined.await.into_iter().flatten() {
-            tracing::trace!(handle = ?handle, "socket closed");
-            self.sockets_ctx.remove(&handle);
-            self.socket_set.remove(handle);
-        }
-    }
-
-    fn poll_socket(
-        handle: SocketHandle,
-        socket: &mut tcp::Socket<'static>,
-        ctx: &mut SocketCtx,
-    ) -> impl Future<Output = Option<SocketHandle>> {
-        let mut messages = [None, None];
-
-        if socket.can_recv() {
-            tracing::trace!(handle = ?handle,  queue_size = socket.recv_queue(), "socket can recv");
-            if let Err(e) = socket.recv(|buf| {
-                tracing::trace!(handle = ?handle, read = buf.len(), "read data from socket");
-                let data = buf.to_vec().into_boxed_slice();
-
-                messages[0] = Some(FromWgMsg::Data(data));
-
-                (buf.len(), ())
-            }) {
-                tracing::warn!(?e, "error reading from socket");
+        for (handle, socket) in socket_set.iter_mut() {
+            let Some(ctx) = sockets_ctx.get_mut(&handle) else {
+                continue;
             };
-        }
 
-        if socket.can_send() {
-            tracing::trace!(handle = ?handle, "socket can send");
+            let socket = tcp::Socket::downcast_mut(socket).expect("all sockets are tcp");
 
-            tracing::trace!(handle = ?handle, queue_len = ctx.send_queue.len(), "sending queued data");
+            // Only pull data out of the tunnel when the client has room for it.
+            if socket.can_recv() && ctx.sender.capacity() > 0 {
+                let mut receiver_gone = false;
 
-            while let Some(data) = ctx.send_queue.pop() {
-                tracing::trace!(handle = ?handle, data_len = data.len(), "sending data");
+                let res = socket.recv(|buf| {
+                    let len = buf.len().min(MAX_SOCKET_CHUNK);
+                    let data = buf[..len].to_vec().into_boxed_slice();
 
-                let sent = socket.send_slice(&data).unwrap_or(0);
+                    if ctx.sender.try_send(FromWgMsg::Data(data)).is_ok() {
+                        (len, ())
+                    } else {
+                        // Don't consume data we can't hand off.
+                        receiver_gone = true;
+                        (0, ())
+                    }
+                });
 
-                if sent < data.len() {
-                    ctx.send_queue
-                        .push(data[sent..].to_vec().into_boxed_slice());
-                    break;
-                } else if !socket.can_send() {
-                    break;
+                if let Err(e) = res {
+                    tracing::warn!(?e, "error reading from socket");
                 }
+
+                if receiver_gone {
+                    closed_sockets.push(handle);
+                    continue;
+                }
+            }
+
+            while socket.can_send() {
+                let Some(data) = ctx.send_queue.pop_front() else {
+                    break;
+                };
+
+                match socket.send_slice(&data) {
+                    Ok(sent) if sent == data.len() => {}
+                    Ok(sent) => {
+                        // Push the unsent remainder back to the front so the
+                        // stream order is preserved.
+                        ctx.send_queue
+                            .push_front(data[sent..].to_vec().into_boxed_slice());
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::trace!(?e, "error writing to socket");
+                        ctx.send_queue.push_front(data);
+                        break;
+                    }
+                }
+            }
+
+            match socket.state() {
+                tcp::State::Closed => closed_sockets.push(handle),
+                tcp::State::CloseWait if !socket.can_recv() => closed_sockets.push(handle),
+                _ => {}
             }
         }
 
-        if matches!(socket.state(), tcp::State::Closed | tcp::State::CloseWait) {
-            tracing::trace!(handle = ?handle, "socket is closed");
-
-            messages[1] = Some(FromWgMsg::Close);
-        }
-
-        join_all(messages.into_iter().flatten().map(move |msg| {
-            let sender = ctx.sender.clone();
-            async move {
-                let mut close = matches!(msg, FromWgMsg::Close);
-                if let Err(e) = sender.send(msg).await {
-                    tracing::warn!(?e, "error sending message to socket");
-                    close = true;
-                }
-
-                if close {
-                    Some(handle)
-                } else {
-                    None
-                }
+        for handle in closed_sockets.drain(..) {
+            if let Some(ctx) = sockets_ctx.remove(&handle) {
+                // Dropping the sender wakes up the connection task as well.
+                let _ = ctx.sender.try_send(FromWgMsg::Close);
             }
-        }))
-        .map(|to_close| to_close.into_iter().find_map(|h| h))
+            socket_set.remove(handle);
+        }
     }
 
-    async fn handle_msg(&mut self, msg: ToWgMsg) {
+    fn handle_msg(&mut self, msg: ToWgMsg) {
         match msg {
             ToWgMsg::Connect(addr, sender) => {
                 tracing::trace!(?addr, "connecting to address");
@@ -533,81 +547,129 @@ impl IfaceHandler {
                     self.next_ephemeral_port.get(),
                 ) {
                     tracing::warn!(?e, "error connecting to address");
-
+                    // Tell the client we gave up instead of leaving it hanging.
+                    let _ = sender.try_send(FromWgMsg::Close);
                     return;
                 }
 
-                self.next_ephemeral_port = self.next_ephemeral_port.saturating_add(1);
+                self.next_ephemeral_port = next_ephemeral_port(self.next_ephemeral_port);
 
                 let handle = self.socket_set.add(socket);
 
-                if sender.send(FromWgMsg::Connect(handle)).await.is_err() {
-                    tracing::error!("error sending connect message to socket");
-                    self.socket_set.get_mut::<tcp::Socket>(handle).abort();
+                if sender.try_send(FromWgMsg::Connect(handle)).is_err() {
+                    tracing::debug!("error sending connect message to socket");
+                    self.socket_set.remove(handle);
+                    return;
                 }
 
                 self.sockets_ctx.insert(
                     handle,
                     SocketCtx {
                         sender,
-                        send_queue: Vec::new(),
+                        send_queue: VecDeque::new(),
                     },
                 );
             }
             ToWgMsg::Data(handle, data) => {
-                if let Some(ctx) = self.sockets_ctx.get_mut(&handle) {
-                    let socket = self.socket_set.get_mut::<tcp::Socket>(handle);
+                let over_limit = self
+                    .sockets_ctx
+                    .get(&handle)
+                    .is_some_and(|ctx| ctx.send_queue.len() >= MAX_QUEUED_WRITES);
 
-                    if socket.can_send() {
-                        tracing::trace!(handle = ?handle, data_len = data.len(), "socket can send");
+                if over_limit {
+                    tracing::debug!(?handle, "send queue full, aborting connection");
 
-                        let sent = socket.send_slice(&data).unwrap_or(0);
+                    if let Some(ctx) = self.sockets_ctx.remove(&handle) {
+                        let _ = ctx.sender.try_send(FromWgMsg::Close);
+                    }
+                    self.socket_set.remove(handle);
+                    return;
+                }
 
-                        if sent < data.len() {
-                            tracing::trace!(handle = ?handle, data_len = data.len(), sent, "socket can't send all data, queueing");
+                let Some(ctx) = self.sockets_ctx.get_mut(&handle) else {
+                    tracing::trace!(?handle, "socket not found");
+                    return;
+                };
 
+                let socket = self.socket_set.get_mut::<tcp::Socket>(handle);
+
+                if socket.can_send() {
+                    match socket.send_slice(&data) {
+                        Ok(sent) if sent == data.len() => {}
+                        Ok(sent) => {
+                            tracing::trace!(?handle, sent, "socket can't send all data, queueing");
                             ctx.send_queue
-                                .push(data[sent..].to_vec().into_boxed_slice());
+                                .push_back(data[sent..].to_vec().into_boxed_slice());
                         }
-                    } else {
-                        tracing::trace!(handle = ?handle, "socket can't send, queueing data");
-
-                        ctx.send_queue.push(data);
+                        Err(e) => {
+                            tracing::trace!(?e, ?handle, "error writing to socket, queueing");
+                            ctx.send_queue.push_back(data);
+                        }
                     }
                 } else {
-                    tracing::warn!(handle = ?handle, "socket not found");
+                    tracing::trace!(?handle, "socket can't send, queueing data");
+                    ctx.send_queue.push_back(data);
                 }
             }
             ToWgMsg::Close(handle) => {
-                tracing::trace!(handle = ?handle, "closing socket");
+                tracing::trace!(?handle, "closing socket");
 
-                if self.sockets_ctx.contains_key(&handle) {
-                    self.socket_set.get_mut::<tcp::Socket>(handle).abort();
+                if self.sockets_ctx.remove(&handle).is_some() {
+                    self.socket_set.remove(handle);
                 }
             }
         }
     }
 
     fn wait_for_poll_iface(
-        now: std::time::Instant,
+        now: StdInstant,
         delay: Option<SmolDuration>,
     ) -> impl Future<Output = ()> {
-        match delay {
-            None => {
-                tracing::trace!("waiting for device for next poll");
+        let Some(delay) = delay else {
+            return Either::Left(std::future::pending());
+        };
 
-                Either::Left(Either::Left(std::future::pending()))
-            }
-            Some(SmolDuration::ZERO) => Either::Left(Either::Right(std::future::ready(()))),
-            Some(delay) => {
-                let wait_dur = StdDuration::from_micros(delay.total_micros());
-                let next_wake = now + wait_dur;
-                tracing::trace!(next_wake_ms = wait_dur.as_millis(), elapsed = ?std::time::Instant::now().saturating_duration_since(now), "will poll iface");
+        // A zero delay means "poll again immediately"; still wait a little so
+        // an idle interface doesn't spin at 100% CPU.
+        let wait = StdDuration::from_micros(delay.total_micros()).max(MIN_POLL_WAIT);
+        let next_wake = now + wait;
 
-                Either::Right(tokio::time::sleep_until(tokio::time::Instant::from_std(
-                    next_wake,
-                )))
-            }
+        Either::Right(tokio::time::sleep_until(TokioInstant::from_std(next_wake)))
+    }
+}
+
+/// Returns the next ephemeral source port, wrapping back into the ephemeral range.
+const fn next_ephemeral_port(port: NonZeroU16) -> NonZeroU16 {
+    let next = port.get().wrapping_add(1);
+
+    if next >= 1024 {
+        NonZeroU16::new(next).unwrap()
+    } else {
+        NonZeroU16::new(1024).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ephemeral_ports_stay_in_range_and_wrap() {
+        let mut port = NonZeroU16::new(1024).unwrap();
+
+        for expected in 1025..=1100 {
+            port = next_ephemeral_port(port);
+            assert_eq!(port.get(), expected);
         }
+
+        // The counter has to wrap instead of sticking at the top of the range.
+        assert_eq!(
+            next_ephemeral_port(NonZeroU16::new(u16::MAX).unwrap()).get(),
+            1024
+        );
+        assert_eq!(
+            next_ephemeral_port(NonZeroU16::new(1023).unwrap()).get(),
+            1024
+        );
     }
 }

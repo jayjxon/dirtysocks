@@ -8,6 +8,7 @@ tokio = { version = "1.40.0", default-features = false, features = [
     "net",
     "macros",
     "sync",
+    "time",
     "rt",
 ] }
 hickory-resolver = "0.24.1"
