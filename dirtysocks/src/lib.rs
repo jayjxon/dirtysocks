@@ -19,7 +19,7 @@ use smoltcp::{
     iface::{self, Config, SocketHandle, SocketSet},
     socket::{
         tcp::{self, SocketBuffer},
-        AnySocket,
+        udp, Socket as SmolSocket,
     },
     time::{Duration as SmolDuration, Instant as SmolInstant},
     wire::{HardwareAddress, IpAddress, IpCidr},
@@ -28,7 +28,7 @@ use std::{
     collections::{HashMap, VecDeque},
     convert::Infallible,
     future::Future,
-    net::SocketAddr,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
     pin::pin,
     time::{Duration as StdDuration, Instant as StdInstant},
@@ -61,6 +61,7 @@ const CLIENT_BATCH: usize = 32;
 const MAX_QUEUED_WRITES: usize = 64;
 /// Smallest delay between interface polls, to avoid burning CPU on a busy loop.
 const MIN_POLL_WAIT: StdDuration = StdDuration::from_millis(1);
+const UDP_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -109,6 +110,11 @@ pub struct UserPass {
 enum ToWgMsg {
     Connect(SocketAddr, Sender<FromWgMsg>),
     Data(SocketHandle, Box<[u8]>),
+    Udp {
+        client: SocketAddr,
+        dest: SocketAddr,
+        payload: Box<[u8]>,
+    },
     Close(SocketHandle),
 }
 
@@ -118,6 +124,15 @@ enum FromWgMsg {
     Data(Box<[u8]>),
     Close,
 }
+
+#[derive(Debug)]
+struct UdpReply {
+    client: SocketAddr,
+    source: SocketAddr,
+    payload: Box<[u8]>,
+}
+
+const UDP_MAGIC: &[u8; 4] = b"BRU1";
 
 pub struct ServerOptions {
     pub listener: TcpListener,
@@ -129,6 +144,7 @@ pub struct ServerOptions {
     pub timeout: StdDuration,
     pub user_pass: Option<UserPass>,
     pub iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
+    pub udp_listener: Option<UdpSocket>,
 }
 impl ServerOptions {
     pub fn new(
@@ -146,6 +162,7 @@ impl ServerOptions {
             timeout: StdDuration::from_secs(30),
             user_pass: None,
             max_transmission_unit: 1280,
+            udp_listener: None,
         }
     }
 }
@@ -162,6 +179,90 @@ pub fn cloudflare_resolver() -> TokioResolver {
     )
     .build()
     .expect("failed to build the Cloudflare DNS resolver")
+}
+
+async fn udp_relay(listener: UdpSocket, to_wg: Sender<ToWgMsg>, mut replies: Receiver<UdpReply>) {
+    let mut buf = vec![0; MAX_PACKET_SIZE];
+
+    loop {
+        tokio::select! {
+            received = listener.recv_from(&mut buf) => {
+                let Ok((len, client)) = received else {
+                    continue;
+                };
+
+                let Some((dest, payload)) = parse_udp(&buf[..len]) else {
+                    continue;
+                };
+
+                if to_wg
+                    .send(ToWgMsg::Udp {
+                        client,
+                        dest,
+                        payload: payload.to_vec().into_boxed_slice(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Some(reply) = replies.recv() => {
+                let packet = encode_udp(reply.source, &reply.payload);
+                let _ = listener.send_to(&packet, reply.client).await;
+            }
+        }
+    }
+}
+
+fn parse_udp(data: &[u8]) -> Option<(SocketAddr, &[u8])> {
+    if data.len() < 7 || &data[..4] != UDP_MAGIC {
+        return None;
+    }
+
+    match data[4] {
+        4 => {
+            if data.len() < 11 {
+                return None;
+            }
+
+            let ip = Ipv4Addr::new(data[5], data[6], data[7], data[8]);
+            let port = u16::from_be_bytes([data[9], data[10]]);
+            Some((SocketAddr::from((ip, port)), &data[11..]))
+        }
+        6 => {
+            if data.len() < 23 {
+                return None;
+            }
+
+            let mut octets = [0; 16];
+            octets.copy_from_slice(&data[5..21]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([data[21], data[22]]);
+            Some((SocketAddr::from((ip, port)), &data[23..]))
+        }
+        _ => None,
+    }
+}
+
+fn encode_udp(source: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(payload.len() + 23);
+    packet.extend_from_slice(UDP_MAGIC);
+
+    match source {
+        SocketAddr::V4(addr) => {
+            packet.push(4);
+            packet.extend_from_slice(&addr.ip().octets());
+        }
+        SocketAddr::V6(addr) => {
+            packet.push(6);
+            packet.extend_from_slice(&addr.ip().octets());
+        }
+    }
+
+    packet.extend_from_slice(&source.port().to_be_bytes());
+    packet.extend_from_slice(payload);
+    packet
 }
 
 /// A socks5 server implementation, sending data to a single `WireGuard` peer.
@@ -197,6 +298,11 @@ impl Server {
         iface.update_ip_addrs(|ip_addrs| *ip_addrs = opts.iface_addrs);
 
         let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(MSG_BATCH);
+        let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(CLIENT_BATCH);
+
+        if let Some(udp_listener) = opts.udp_listener {
+            tokio::spawn(udp_relay(udp_listener, socket_tx.clone(), udp_rx));
+        }
 
         let this = Self {
             listener: opts.listener,
@@ -207,6 +313,9 @@ impl Server {
                 peer,
                 next_ephemeral_port: NonZeroU16::new(1024).unwrap(),
                 sockets_ctx: HashMap::new(),
+                udp_ctx: HashMap::new(),
+                udp_last_used: HashMap::new(),
+                udp_tx,
                 closed_sockets: Vec::new(),
                 last_iface_poll: StdInstant::now(),
                 iface_poll_delay: None,
@@ -389,6 +498,9 @@ pub struct IfaceHandler {
     iface: iface::Interface,
     peer: wg::Peer,
     socket_set: SocketSet<'static>,
+    udp_ctx: HashMap<SocketHandle, (SocketAddr, SocketAddr)>,
+    udp_last_used: HashMap<SocketHandle, StdInstant>,
+    udp_tx: Sender<UdpReply>,
     closed_sockets: Vec<SocketHandle>,
     last_iface_poll: StdInstant,
     iface_poll_delay: Option<SmolDuration>,
@@ -462,71 +574,107 @@ impl IfaceHandler {
         let Self {
             socket_set,
             sockets_ctx,
+            udp_ctx,
+            udp_last_used,
+            udp_tx,
             closed_sockets,
             ..
         } = self;
 
         closed_sockets.clear();
 
+        let now = StdInstant::now();
+        closed_sockets.extend(
+            udp_last_used
+                .iter()
+                .filter(|(_, last_used)| now.duration_since(**last_used) >= UDP_IDLE_TIMEOUT)
+                .map(|(handle, _)| *handle),
+        );
+
         for (handle, socket) in socket_set.iter_mut() {
-            let Some(ctx) = sockets_ctx.get_mut(&handle) else {
-                continue;
-            };
+            match socket {
+                SmolSocket::Tcp(socket) => {
+                    let Some(ctx) = sockets_ctx.get_mut(&handle) else {
+                        continue;
+                    };
 
-            let socket = tcp::Socket::downcast_mut(socket).expect("all sockets are tcp");
+                    // Only pull data out of the tunnel when the client has room for it.
+                    if socket.can_recv() && ctx.sender.capacity() > 0 {
+                        let mut receiver_gone = false;
 
-            // Only pull data out of the tunnel when the client has room for it.
-            if socket.can_recv() && ctx.sender.capacity() > 0 {
-                let mut receiver_gone = false;
+                        let res = socket.recv(|buf| {
+                            let len = buf.len().min(MAX_SOCKET_CHUNK);
+                            let data = buf[..len].to_vec().into_boxed_slice();
 
-                let res = socket.recv(|buf| {
-                    let len = buf.len().min(MAX_SOCKET_CHUNK);
-                    let data = buf[..len].to_vec().into_boxed_slice();
+                            if ctx.sender.try_send(FromWgMsg::Data(data)).is_ok() {
+                                (len, ())
+                            } else {
+                                // Don't consume data we can't hand off.
+                                receiver_gone = true;
+                                (0, ())
+                            }
+                        });
 
-                    if ctx.sender.try_send(FromWgMsg::Data(data)).is_ok() {
-                        (len, ())
-                    } else {
-                        // Don't consume data we can't hand off.
-                        receiver_gone = true;
-                        (0, ())
+                        if let Err(e) = res {
+                            tracing::warn!(?e, "error reading from socket");
+                        }
+
+                        if receiver_gone {
+                            closed_sockets.push(handle);
+                            continue;
+                        }
                     }
-                });
 
-                if let Err(e) = res {
-                    tracing::warn!(?e, "error reading from socket");
-                }
+                    while socket.can_send() {
+                        let Some(data) = ctx.send_queue.pop_front() else {
+                            break;
+                        };
 
-                if receiver_gone {
-                    closed_sockets.push(handle);
-                    continue;
-                }
-            }
-
-            while socket.can_send() {
-                let Some(data) = ctx.send_queue.pop_front() else {
-                    break;
-                };
-
-                match socket.send_slice(&data) {
-                    Ok(sent) if sent == data.len() => {}
-                    Ok(sent) => {
-                        // Push the unsent remainder back to the front so the
-                        // stream order is preserved.
-                        ctx.send_queue
-                            .push_front(data[sent..].to_vec().into_boxed_slice());
-                        break;
+                        match socket.send_slice(&data) {
+                            Ok(sent) if sent == data.len() => {}
+                            Ok(sent) => {
+                                // Push the unsent remainder back to the front so the
+                                // stream order is preserved.
+                                ctx.send_queue
+                                    .push_front(data[sent..].to_vec().into_boxed_slice());
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::trace!(?e, "error writing to socket");
+                                ctx.send_queue.push_front(data);
+                                break;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::trace!(?e, "error writing to socket");
-                        ctx.send_queue.push_front(data);
-                        break;
+
+                    match socket.state() {
+                        tcp::State::Closed => closed_sockets.push(handle),
+                        tcp::State::CloseWait if !socket.can_recv() => closed_sockets.push(handle),
+                        _ => {}
                     }
                 }
-            }
-
-            match socket.state() {
-                tcp::State::Closed => closed_sockets.push(handle),
-                tcp::State::CloseWait if !socket.can_recv() => closed_sockets.push(handle),
+                SmolSocket::Udp(socket) => {
+                    if socket.can_recv() {
+                        if let Ok((data, _meta)) = socket.recv() {
+                            if let Some((client, source)) = udp_ctx.get(&handle).copied() {
+                                if udp_tx
+                                    .try_send(UdpReply {
+                                        client,
+                                        source,
+                                        payload: data.to_vec().into_boxed_slice(),
+                                    })
+                                    .is_ok()
+                                {
+                                    udp_last_used.insert(handle, StdInstant::now());
+                                } else {
+                                    closed_sockets.push(handle);
+                                }
+                            } else {
+                                closed_sockets.push(handle);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -536,6 +684,8 @@ impl IfaceHandler {
                 // Dropping the sender wakes up the connection task as well.
                 let _ = ctx.sender.try_send(FromWgMsg::Close);
             }
+            udp_ctx.remove(&handle);
+            udp_last_used.remove(&handle);
             socket_set.remove(handle);
         }
     }
@@ -622,6 +772,40 @@ impl IfaceHandler {
                     tracing::trace!(?handle, "socket can't send, queueing data");
                     ctx.send_queue.push_back(data);
                 }
+            }
+            ToWgMsg::Udp {
+                client,
+                dest,
+                payload,
+            } => {
+                let mut socket = udp::Socket::new(
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; 64],
+                        vec![0; MAX_PACKET_SIZE],
+                    ),
+                    udp::PacketBuffer::new(
+                        vec![udp::PacketMetadata::EMPTY; 64],
+                        vec![0; MAX_PACKET_SIZE],
+                    ),
+                );
+
+                if let Err(e) = socket.bind(self.next_ephemeral_port.get()) {
+                    tracing::warn!(?e, "error binding UDP socket");
+                    return;
+                }
+
+                self.next_ephemeral_port = next_ephemeral_port(self.next_ephemeral_port);
+
+                if let Err(e) =
+                    socket.send_slice(&payload, (IpAddress::from(dest.ip()), dest.port()))
+                {
+                    tracing::warn!(?e, "error sending UDP datagram");
+                    return;
+                }
+
+                let handle = self.socket_set.add(socket);
+                self.udp_ctx.insert(handle, (client, dest));
+                self.udp_last_used.insert(handle, StdInstant::now());
             }
             ToWgMsg::Close(handle) => {
                 tracing::trace!(?handle, "closing socket");
