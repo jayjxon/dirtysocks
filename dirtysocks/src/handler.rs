@@ -1,5 +1,5 @@
 #![allow(clippy::missing_errors_doc)]
-use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::TokioResolver;
 use seq_macro::seq;
 use std::{
     marker::PhantomData,
@@ -139,7 +139,7 @@ pub struct Piping;
 pub struct Connection<State> {
     pub stream: TcpStream,
     client_addr: SocketAddr,
-    resolver: TokioAsyncResolver,
+    resolver: TokioResolver,
     timeout: Duration,
     pub buf: Box<[u8]>,
     user_pass: Option<crate::UserPass>,
@@ -161,7 +161,7 @@ impl Connection<Initial> {
     pub fn new(
         stream: TcpStream,
         client_addr: SocketAddr,
-        resolver: TokioAsyncResolver,
+        resolver: TokioResolver,
         timeout: Duration,
         user_pass: Option<crate::UserPass>,
     ) -> Self {
@@ -444,12 +444,11 @@ fn change_state<O, N>(old: Connection<O>) -> Connection<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_resolver::config::{ResolverConfig, ResolverOpts};
     use std::net::Ipv4Addr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn resolver() -> TokioAsyncResolver {
-        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+    fn resolver() -> TokioResolver {
+        crate::cloudflare_resolver()
     }
 
     fn user_pass(username: &str, password: &str) -> crate::UserPass {

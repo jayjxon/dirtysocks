@@ -10,8 +10,9 @@ use boringtun::noise::Tunn;
 use futures_util::{future::Either, stream::FuturesUnordered, StreamExt};
 use handler::{Connection, Initial};
 use hickory_resolver::{
-    config::{ResolverConfig, ResolverOpts},
-    TokioAsyncResolver,
+    config::{ResolverConfig, CLOUDFLARE},
+    net::runtime::TokioRuntimeProvider,
+    TokioResolver,
 };
 use smoltcp::{
     config::IFACE_MAX_ADDR_COUNT,
@@ -84,7 +85,7 @@ pub enum Error {
     #[error("invalid string")]
     Utf8(#[from] std::str::Utf8Error),
     #[error("dns lookup error: {0}")]
-    DnsLookup(#[from] hickory_resolver::error::ResolveError),
+    DnsLookup(#[from] hickory_resolver::net::NetError),
     #[error("no such host")]
     NoSuchHost,
     #[error("timeout: {0}")]
@@ -124,7 +125,7 @@ pub struct ServerOptions {
     /// The address of the wireguard server.
     pub endpoint_addr: SocketAddr,
     pub max_transmission_unit: usize,
-    pub resolver: TokioAsyncResolver,
+    pub resolver: TokioResolver,
     pub timeout: StdDuration,
     pub user_pass: Option<UserPass>,
     pub iface_addrs: heapless::Vec<IpCidr, IFACE_MAX_ADDR_COUNT>,
@@ -141,10 +142,7 @@ impl ServerOptions {
             endpoint_addr,
             tunn,
             iface_addrs,
-            resolver: TokioAsyncResolver::tokio(
-                ResolverConfig::cloudflare(),
-                ResolverOpts::default(),
-            ),
+            resolver: cloudflare_resolver(),
             timeout: StdDuration::from_secs(30),
             user_pass: None,
             max_transmission_unit: 1280,
@@ -152,11 +150,25 @@ impl ServerOptions {
     }
 }
 
+/// Builds a resolver backed by Cloudflare's public DNS.
+///
+/// # Panics
+/// Panics if the resolver cannot be built.
+#[must_use]
+pub fn cloudflare_resolver() -> TokioResolver {
+    TokioResolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+        TokioRuntimeProvider::default(),
+    )
+    .build()
+    .expect("failed to build the Cloudflare DNS resolver")
+}
+
 /// A socks5 server implementation, sending data to a single `WireGuard` peer.
 pub struct Server {
     pub listener: TcpListener,
     pub iface: Option<IfaceHandler>,
-    pub resolver: TokioAsyncResolver,
+    pub resolver: TokioResolver,
     pub timeout: StdDuration,
     pub user_pass: Option<UserPass>,
     pub next_ephemeral_port: u16,

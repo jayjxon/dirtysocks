@@ -9,10 +9,6 @@ use boringtun::{
     x25519::{PublicKey, StaticSecret},
 };
 use dirtysocks::ServerOptions;
-use hickory_resolver::{
-    config::{ResolverConfig, ResolverOpts},
-    TokioAsyncResolver,
-};
 use tokio::net::TcpListener;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -44,24 +40,17 @@ async fn main() -> Result<()> {
         panic!("only one peer is allowed")
     };
 
+    let resolver = dirtysocks::cloudflare_resolver();
+
     let endpoint_ip = match IpAddr::from_str(&peer.endpoint.0) {
         Ok(ip) => ip,
-        Err(_) => TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+        Err(_) => resolver
             .lookup_ip(&peer.endpoint.0)
             .await?
             .iter()
             .next()
             .context("no IPs found for endpoint address")?,
     };
-
-    // TODO: use custom resolver
-    // let mut resolver_conf = ResolverConfig::new();
-    // resolver_conf.add_name_server(NameServerConfig::new(
-    //     SocketAddr::from((conf.interface.dns, 53)),
-    //     Protocol::Udp,
-    // ));
-    let resolver_conf = ResolverConfig::cloudflare();
-    let resolver = TokioAsyncResolver::tokio(resolver_conf, ResolverOpts::default());
     dirtysocks::Server::listen(ServerOptions {
         listener: TcpListener::bind(args.host).await?,
         endpoint_addr: SocketAddr::from((endpoint_ip, peer.endpoint.1)),
@@ -72,8 +61,7 @@ async fn main() -> Result<()> {
             None,
             0,
             None,
-        )
-        .map_err(|e| eyre!("failed to create Tunn: {}", e))?,
+        ),
         iface_addrs: heapless::Vec::from_slice(&conf.interface.addresses)
             .ok()
             .context("too many interface addresses")?,

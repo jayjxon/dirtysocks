@@ -253,9 +253,9 @@ pub struct WgRxToken {
     packet: Vec<u8>,
 }
 impl RxToken for WgRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
         // Parsing every packet just to log it is wasted work on the hot path.
         if tracing::enabled!(tracing::Level::TRACE) {
@@ -267,7 +267,7 @@ impl RxToken for WgRxToken {
             }
         }
 
-        f(&mut self.packet)
+        f(&self.packet)
     }
 }
 
@@ -349,8 +349,7 @@ mod tests {
             None,
             0,
             None,
-        )
-        .unwrap();
+        );
         let server = Tunn::new(
             server_secret,
             PublicKey::from(&client_secret),
@@ -358,8 +357,7 @@ mod tests {
             None,
             1,
             None,
-        )
-        .unwrap();
+        );
 
         (client, server)
     }
