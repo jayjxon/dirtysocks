@@ -20,6 +20,52 @@ use crate::MAX_PACKET_SIZE;
 /// How often the `WireGuard` timers are updated.
 const TIMER_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Anti-DPI obfuscation for the `WireGuard` transport.
+///
+/// Networks that block `WireGuard` usually do it in one of two ways: they
+/// fingerprint the cleartext handshake header of the first datagram of a flow,
+/// or they blacklist the UDP 5-tuple once they have seen one. Neither needs a
+/// modified server to defeat:
+///
+/// - random junk datagrams are sent before every handshake initiation, so the
+///   first packet of the flow no longer looks like `WireGuard`. A standard peer
+///   discards them as unparseable;
+/// - the UDP socket moves to a fresh source port whenever a handshake is
+///   retried, so a block tied to the old 5-tuple no longer applies. `WireGuard`
+///   peers follow roaming clients, so the session is unaffected.
+#[derive(Clone, Copy, Debug)]
+pub struct Obfuscation {
+    /// Number of junk datagrams sent before every handshake initiation.
+    pub junk_packets: u32,
+    /// Smallest junk datagram, in bytes.
+    pub junk_min_size: usize,
+    /// Largest junk datagram, in bytes.
+    pub junk_max_size: usize,
+    /// Move to a new source port when a handshake is retried.
+    pub rotate_source_port: bool,
+}
+
+impl Obfuscation {
+    /// Sends exactly the same packets a stock `WireGuard` client would.
+    pub const OFF: Self = Self {
+        junk_packets: 0,
+        junk_min_size: 0,
+        junk_max_size: 0,
+        rotate_source_port: false,
+    };
+}
+
+impl Default for Obfuscation {
+    fn default() -> Self {
+        Self {
+            junk_packets: 4,
+            junk_min_size: 50,
+            junk_max_size: 1000,
+            rotate_source_port: true,
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("i/o error: {0}")]
@@ -57,6 +103,10 @@ pub struct Peer {
     pub should_poll: bool,
 
     pub buf: Box<[u8]>,
+
+    obfuscation: Obfuscation,
+    /// Handshakes started without a session coming up in between.
+    handshake_attempts: u32,
 }
 
 impl Peer {
@@ -73,7 +123,86 @@ impl Peer {
             should_poll: false,
 
             buf: vec![0; MAX_PACKET_SIZE].into_boxed_slice(),
+
+            obfuscation: Obfuscation::OFF,
+            handshake_attempts: 0,
         }
+    }
+
+    #[must_use]
+    pub fn with_obfuscation(mut self, obfuscation: Obfuscation) -> Self {
+        self.obfuscation = obfuscation;
+        self
+    }
+
+    /// Starts a handshake, optionally preceded by junk and on a fresh port.
+    async fn start_handshake(&mut self) -> Result<(), Error> {
+        if self.obfuscation.rotate_source_port && self.handshake_attempts > 0 {
+            if let Err(e) = self.rotate_source_port().await {
+                // Not fatal: the old socket still works.
+                tracing::warn!(?e, "failed to rotate source port");
+            }
+        }
+
+        self.handshake_attempts = self.handshake_attempts.saturating_add(1);
+        self.send_junk().await?;
+
+        let mut res = self.tunn.format_handshake_initiation(&mut self.buf, true);
+
+        loop {
+            match res {
+                TunnResult::WriteToNetwork(packet) => {
+                    tracing::trace!(num_bytes = packet.len(), "writing handshake to peer network");
+                    self.conn.send(packet).await?;
+                    res = self.tunn.decapsulate(None, &[], &mut self.buf);
+                }
+                TunnResult::Err(e) => break Err(e.into()),
+                _ => break Ok(()),
+            }
+        }
+    }
+
+    /// Best effort: junk that fails to send must never break the handshake.
+    async fn send_junk(&mut self) -> Result<(), Error> {
+        let Some(packets) = std::num::NonZeroU32::new(self.obfuscation.junk_packets) else {
+            return Ok(());
+        };
+
+        let min = self.obfuscation.junk_min_size.clamp(1, MAX_PACKET_SIZE);
+        let max = self.obfuscation.junk_max_size.clamp(min, MAX_PACKET_SIZE);
+
+        for _ in 0..packets.get() {
+            let span = (max - min + 1) as u32;
+            let len = min + (rand::random::<u32>() % span) as usize;
+            let payload: Vec<u8> = (0..len).map(|_| rand::random::<u8>()).collect();
+
+            if let Err(e) = self.conn.send(&payload).await {
+                tracing::debug!(?e, "failed to send junk packet");
+                return Ok(());
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn rotate_source_port(&mut self) -> Result<(), Error> {
+        let bind_addr = if self.addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0u16; 8], 0))
+        };
+
+        let conn = UdpSocket::bind(bind_addr).await?;
+        conn.connect(self.addr).await?;
+
+        tracing::debug!(
+            local = ?conn.local_addr().ok(),
+            "rotated source port for handshake retry"
+        );
+
+        self.conn = conn;
+
+        Ok(())
     }
 
     pub async fn poll_device(
@@ -140,18 +269,7 @@ impl Peer {
 
                 // There is no live session, so this packet can't be sent. Start
                 // a handshake; the upper layer retransmits the data.
-                let mut res = self.tunn.format_handshake_initiation(&mut self.buf, true);
-
-                loop {
-                    match res {
-                        TunnResult::WriteToNetwork(packet) => {
-                            self.conn.send(packet).await?;
-                            res = self.tunn.decapsulate(None, &[], &mut self.buf);
-                        }
-                        TunnResult::Err(e) => break Err(e.into()),
-                        _ => break Ok(()),
-                    }
-                }
+                self.start_handshake().await
             }
             TunnResult::Err(e) => Err(e.into()),
             res => {
@@ -191,6 +309,9 @@ impl Peer {
                     self.rx_queue.push_front(packet.to_vec());
                     self.should_poll = true;
 
+                    // A decrypted packet proves the session is up.
+                    self.handshake_attempts = 0;
+
                     break Ok(());
                 }
 
@@ -198,7 +319,8 @@ impl Peer {
 
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
                     tracing::debug!("connection expired; re-handshaking");
-                    res = self.tunn.format_handshake_initiation(&mut self.buf, true);
+                    self.start_handshake().await?;
+                    break Ok(());
                 }
 
                 TunnResult::Err(e) => break Err(e.into()),
@@ -233,6 +355,9 @@ impl Peer {
                     self.rx_queue.push_front(packet.to_vec());
                     self.should_poll = true;
 
+                    // A decrypted packet proves the session is up.
+                    self.handshake_attempts = 0;
+
                     break Ok(());
                 }
 
@@ -240,7 +365,8 @@ impl Peer {
 
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
                     tracing::debug!("connection expired; re-handshaking");
-                    res = self.tunn.format_handshake_initiation(buf, true);
+                    self.start_handshake().await?;
+                    break Ok(());
                 }
 
                 TunnResult::Err(e) => break Err(e.into()),
@@ -251,6 +377,12 @@ impl Peer {
 
 pub struct WgRxToken {
     packet: Vec<u8>,
+}
+impl WgRxToken {
+    #[must_use]
+    pub fn new(packet: Vec<u8>) -> Self {
+        Self { packet }
+    }
 }
 impl RxToken for WgRxToken {
     fn consume<R, F>(self, f: F) -> R
@@ -273,6 +405,12 @@ impl RxToken for WgRxToken {
 
 pub struct WgTxToken<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
+}
+impl<'a> WgTxToken<'a> {
+    #[must_use]
+    pub fn new(tx: &'a mut VecDeque<Vec<u8>>) -> Self {
+        Self { tx }
+    }
 }
 impl<'a> TxToken for WgTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -459,6 +597,50 @@ mod tests {
 
         let (rx, _tx) = peer.receive(smoltcp::time::Instant::now()).unwrap();
         rx.consume(|buf| assert_eq!(buf, incoming.as_slice()));
+    }
+
+    #[tokio::test]
+    async fn obfuscation_sends_junk_and_rotates_source_port() {
+        let (client_tunn, _server_tunn) = tunnels();
+
+        let client_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        client_sock.connect(server_addr).await.unwrap();
+
+        let mut peer = Peer::new(client_tunn, server_addr, client_sock, 1280).with_obfuscation(
+            Obfuscation {
+                junk_packets: 3,
+                junk_min_size: 400,
+                junk_max_size: 420,
+                rotate_source_port: true,
+            },
+        );
+
+        let first_port = peer.conn.local_addr().unwrap();
+
+        // A retry must come from a fresh source port.
+        peer.handshake_attempts = 1;
+        peer.start_handshake().await.unwrap();
+
+        assert_ne!(peer.conn.local_addr().unwrap(), first_port);
+
+        let mut wire = vec![0u8; MAX_PACKET_SIZE];
+        let mut sizes = Vec::new();
+
+        for _ in 0..4 {
+            let len = timeout(TEST_TIMEOUT, server_sock.recv(&mut wire))
+                .await
+                .unwrap()
+                .unwrap();
+            sizes.push(len);
+        }
+
+        // Junk first, then the real handshake initiation (always 148 bytes).
+        for len in &sizes[..3] {
+            assert!((400..=420).contains(len), "unexpected junk size {len}");
+        }
+        assert_eq!(sizes[3], 148);
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub struct Interface {
 #[derive(Clone, Debug)]
 pub struct Peer {
     pub public_key: [u8; 32],
+    pub preshared_key: Option<[u8; 32]>,
+    pub persistent_keepalive: Option<u16>,
     pub allowed_ips: Vec<IpCidr>,
     pub endpoint: (String, u16),
 }
@@ -38,10 +40,21 @@ impl Conf {
         let interface = parsed.section(Some("Interface")).context(n!("Interface"))?;
 
         let private_key = decode_key(interface.get("PrivateKey").context(n!("PrivateKey"))?)?;
+        // `wg-quick` allows several addresses on one line, separated by commas.
+        // Parsing the whole value as a single CIDR silently drops every address.
         let addresses = interface
             .get_all("Address")
+            .flat_map(|value| value.split(','))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .flat_map(IpCidr::from_str)
             .collect::<Vec<_>>();
+
+        if addresses.is_empty() {
+            return Err(eyre!(
+                "couldn't parse any `Address` entries in the `Interface` section"
+            ));
+        }
         let dns = interface.get("DNS").context(n!("DNS"))?.parse()?;
         let mtu = interface
             .get("MTU")
@@ -67,8 +80,20 @@ impl Conf {
             .section_all(Some("Peer"))
             .flat_map(|peer| -> Result<Peer> {
                 let public_key = decode_key(peer.get("PublicKey").context(n!("PublicKey"))?)?;
+
+                // Providers such as Windscribe require the preshared key: the
+                // handshake is rejected without it.
+                let preshared_key = peer.get("PresharedKey").map(decode_key).transpose()?;
+                let persistent_keepalive = peer
+                    .get("PersistentKeepalive")
+                    .map(str::parse::<u16>)
+                    .transpose()?;
+
                 let allowed_ips = peer
                     .get_all("AllowedIPs")
+                    .flat_map(|value| value.split(','))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
                     .flat_map(IpCidr::from_str)
                     .collect::<Vec<_>>();
                 let (host, port) = peer
@@ -84,6 +109,8 @@ impl Conf {
 
                 Ok(Peer {
                     public_key,
+                    preshared_key,
+                    persistent_keepalive,
                     allowed_ips,
                     endpoint: (host.to_owned(), port),
                 })

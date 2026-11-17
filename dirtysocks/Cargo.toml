@@ -15,6 +15,9 @@ hickory-resolver = "0.26.3"
 strum = { version = "0.28.0", features = ["derive"] }
 untrusted = "0.9.0"
 boringtun = "0.7.1"
+# Vendored: carries the fixes an IKEv2 responder needs (NAT-T notifies, a
+# Configuration Payload request, and IDr handling in the final EAP AUTH).
+ryke = { path = "../vendor/ryke" }
 seq-macro = "0.3.6"
 tracing = "0.1.44"
 thiserror = "2.0.21"

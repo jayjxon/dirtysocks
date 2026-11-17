@@ -314,7 +314,13 @@ impl Connection<Authorized> {
                 tracing::debug!(?domain, ?port, "resolving domain");
                 let ips = self.resolver.lookup_ip(domain).await?;
 
-                let Some(ip) = ips.iter().next() else {
+                // Tunnels carry IPv4 far more reliably than IPv6, so prefer it
+                // when the name has both kinds of record.
+                let Some(ip) = ips
+                    .iter()
+                    .find(|ip| ip.is_ipv4())
+                    .or_else(|| ips.iter().next())
+                else {
                     let (reply_buf, reply_buf_len) =
                         Reply::new(0x04, SocketAddr::from(([0, 0, 0, 0], 0))).to_bytes();
                     self.stream.write_all(&reply_buf[..reply_buf_len]).await?;

@@ -17,6 +17,7 @@ use hickory_resolver::{
 use smoltcp::{
     config::IFACE_MAX_ADDR_COUNT,
     iface::{self, Config, SocketHandle, SocketSet},
+    phy::Device,
     socket::{
         tcp::{self, SocketBuffer},
         udp, Socket as SmolSocket,
@@ -30,19 +31,20 @@ use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::NonZeroU16,
-    pin::pin,
+    pin::{pin, Pin},
     time::{Duration as StdDuration, Instant as StdInstant},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     sync::mpsc::{Receiver, Sender},
-    time::Instant as TokioInstant,
+    time::{Instant as TokioInstant, Sleep},
 };
 use tracing::instrument;
 
 pub mod wg;
-use wg::Peer;
+
+pub mod ike;
 
 pub mod handler;
 
@@ -93,6 +95,10 @@ pub enum Error {
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("error waiting for future: {0}")]
     JoinError(#[from] tokio::task::JoinError),
+    #[error("wireguard error: {0}")]
+    Wg(#[from] wg::Error),
+    #[error("ike error: {0}")]
+    Ike(#[from] ike::Error),
 }
 impl From<untrusted::EndOfInput> for Error {
     fn from(_: untrusted::EndOfInput) -> Self {
@@ -134,10 +140,96 @@ struct UdpReply {
 
 const UDP_MAGIC: &[u8; 4] = b"BRU1";
 
+/// The transport that carries the SOCKS5 traffic to the peer.
+///
+/// A client that does not need `WireGuard` can fall back to IKEv2 on networks
+/// where `WireGuard` is blocked but IPsec is allowed.
+pub enum Transport {
+    /// `WireGuard`, optionally obfuscated against DPI.
+    WireGuard {
+        tunn: Tunn,
+        obfuscation: wg::Obfuscation,
+    },
+    /// IKEv2/IPsec, with the ESP packets carried in UDP.
+    Ike(ike::Peer),
+}
+
+/// Either transport, behind one `smoltcp` device.
+pub enum Peer {
+    Wg(wg::Peer),
+    Ike(ike::Peer),
+}
+
+impl Peer {
+    fn has_rx(&self) -> bool {
+        match self {
+            Self::Wg(peer) => !peer.rx_queue.is_empty(),
+            Self::Ike(peer) => !peer.rx_queue.is_empty(),
+        }
+    }
+
+    fn clear_poll(&mut self) {
+        match self {
+            Self::Wg(peer) => peer.should_poll = false,
+            Self::Ike(peer) => peer.should_poll = false,
+        }
+    }
+
+    fn wants_poll(&self) -> bool {
+        match self {
+            Self::Wg(peer) => peer.should_poll,
+            Self::Ike(peer) => peer.should_poll,
+        }
+    }
+
+    async fn poll_device(
+        &mut self,
+        sleep: Pin<&mut Sleep>,
+        recv_buf: &mut [u8],
+    ) -> Result<(), Error> {
+        match self {
+            Self::Wg(peer) => peer.poll_device(sleep, recv_buf).await?,
+            Self::Ike(peer) => peer.poll_device(sleep, recv_buf).await?,
+        }
+
+        Ok(())
+    }
+}
+
+impl Device for Peer {
+    type RxToken<'a> = wg::WgRxToken;
+    type TxToken<'a> = wg::WgTxToken<'a>;
+
+    fn receive(
+        &mut self,
+        timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        match self {
+            Self::Wg(peer) => peer.receive(timestamp),
+            Self::Ike(peer) => peer.receive(timestamp),
+        }
+    }
+
+    fn transmit(&mut self, timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        match self {
+            Self::Wg(peer) => peer.transmit(timestamp),
+            Self::Ike(peer) => peer.transmit(timestamp),
+        }
+    }
+
+    fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
+        match self {
+            Self::Wg(peer) => peer.capabilities(),
+            Self::Ike(peer) => peer.capabilities(),
+        }
+    }
+}
+
 pub struct ServerOptions {
     pub listener: TcpListener,
-    pub tunn: Tunn,
-    /// The address of the wireguard server.
+    /// Where the traffic is carried: `WireGuard` or IKEv2.
+    pub transport: Transport,
+    /// The address of the remote endpoint.
     pub endpoint_addr: SocketAddr,
     pub max_transmission_unit: usize,
     pub resolver: TokioResolver,
@@ -156,7 +248,10 @@ impl ServerOptions {
         Self {
             listener,
             endpoint_addr,
-            tunn,
+            transport: Transport::WireGuard {
+                tunn,
+                obfuscation: wg::Obfuscation::OFF,
+            },
             iface_addrs,
             resolver: cloudflare_resolver(),
             timeout: StdDuration::from_secs(30),
@@ -280,22 +375,46 @@ pub struct Server {
 // TODO: reuse sockets
 impl Server {
     pub async fn listen(opts: ServerOptions) -> Result<Infallible, Error> {
-        let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
-        peer_conn.connect(opts.endpoint_addr).await?;
+        let mut peer = match opts.transport {
+            Transport::WireGuard { tunn, obfuscation } => {
+                let peer_conn = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?;
+                peer_conn.connect(opts.endpoint_addr).await?;
 
-        let mut peer = Peer::new(
-            opts.tunn,
-            opts.endpoint_addr,
-            peer_conn,
-            opts.max_transmission_unit,
-        );
+                Peer::Wg(
+                    wg::Peer::new(tunn, opts.endpoint_addr, peer_conn, opts.max_transmission_unit)
+                        .with_obfuscation(obfuscation),
+                )
+            }
+            // The IKEv2 peer is already established, on its own socket.
+            Transport::Ike(peer) => Peer::Ike(peer),
+        };
 
         let mut iface_conf = Config::new(HardwareAddress::Ip);
         iface_conf.random_seed = rand::random();
 
         let mut iface = iface::Interface::new(iface_conf, &mut peer, SmolInstant::now());
 
-        iface.update_ip_addrs(|ip_addrs| *ip_addrs = opts.iface_addrs);
+        // A `WireGuard` interface usually has a host address (`/32` or `/128`)
+        // but still routes every destination to the peer. smoltcp selects an
+        // IPv6 source with RFC 6724, which rejects a ULA source for a global
+        // destination, so widen host routes into catch-all prefixes.
+        iface.update_ip_addrs(|ip_addrs| {
+            for cidr in &opts.iface_addrs {
+                let cidr = match cidr {
+                    IpCidr::Ipv4(cidr) if cidr.prefix_len() == 32 => {
+                        IpCidr::new(cidr.address().into(), 0)
+                    }
+                    IpCidr::Ipv6(cidr) if cidr.prefix_len() == 128 => {
+                        IpCidr::new(cidr.address().into(), 0)
+                    }
+                    cidr => *cidr,
+                };
+
+                if ip_addrs.push(cidr).is_err() {
+                    tracing::warn!(?cidr, "too many interface addresses, ignoring");
+                }
+            }
+        });
 
         let (socket_tx, socket_rx) = tokio::sync::mpsc::channel(MSG_BATCH);
         let (udp_tx, udp_rx) = tokio::sync::mpsc::channel(CLIENT_BATCH);
@@ -496,7 +615,7 @@ pub struct IfaceHandler {
     socket_rx: Receiver<ToWgMsg>,
     sockets_ctx: HashMap<SocketHandle, SocketCtx>,
     iface: iface::Interface,
-    peer: wg::Peer,
+    peer: Peer,
     socket_set: SocketSet<'static>,
     udp_ctx: HashMap<SocketHandle, (SocketAddr, SocketAddr)>,
     udp_last_used: HashMap<SocketHandle, StdInstant>,
@@ -517,10 +636,10 @@ impl IfaceHandler {
         let mut msg_queue = Vec::with_capacity(MSG_BATCH);
 
         loop {
-            while needs_poll || !self.peer.rx_queue.is_empty() {
+            while needs_poll || self.peer.has_rx() {
                 self.poll_iface();
                 needs_poll = false;
-                self.peer.should_poll = false;
+                self.peer.clear_poll();
             }
 
             tokio::select! {
@@ -541,7 +660,7 @@ impl IfaceHandler {
                     if let Err(e) = e {
                         tracing::warn!(?e, "error polling device");
                     }
-                    needs_poll |= self.peer.should_poll;
+                    needs_poll |= self.peer.wants_poll();
                 },
 
                 () = Self::wait_for_poll_iface(self.last_iface_poll, self.iface_poll_delay) => {

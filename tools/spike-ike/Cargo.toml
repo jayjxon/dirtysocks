@@ -1,0 +1,9 @@
+[workspace]
+
+[package]
+name = "spike-ike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ryke = { path = "../../vendor/ryke" }

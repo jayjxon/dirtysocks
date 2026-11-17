@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["dirtysocks", "dirtysocks-bin"]
+# Vendored IKEv2 implementation; built as a path dependency, not a member.
+exclude = ["vendor/ryke"]
 
 [profile.release]
 opt-level = 3

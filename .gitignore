@@ -9,3 +9,10 @@ devenv.local.nix
 .pre-commit-config.yaml
 
 *.conf
+
+# IKEv2 spike: build output and dumped server certificates
+tools/spike-ike/target
+tools/spike-ike/out
+
+# vendored IKEv2 crate build output
+vendor/ryke/target
