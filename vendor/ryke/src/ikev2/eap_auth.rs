@@ -152,6 +152,9 @@ pub struct EapInitiator {
     verify: ServerVerify,
     server_verified: bool,
     send_certreq: bool,
+    /// IDr from the responder's first IKE_AUTH message, reused when checking its
+    /// final AUTH (the final message normally omits IDr).
+    idr: Vec<u8>,
 }
 
 impl EapInitiator {
@@ -173,6 +176,7 @@ impl EapInitiator {
             verify,
             server_verified: false,
             send_certreq: false,
+            idr: Vec::new(),
         }
     }
 
@@ -248,6 +252,11 @@ impl EapInitiator {
             self.server_verified = true;
         }
 
+        // Remember the responder's identity for the AUTH key check below.
+        if let Some(idr) = find(&ps, PayloadType::IdResponder) {
+            self.idr = idr.to_vec();
+        }
+
         // Credential firewall: when we require server authentication, refuse to
         // do *anything* else until the server is verified. Otherwise a rogue peer
         // could send a first message with no IDr/AUTH (skipping verify_server) and
@@ -266,11 +275,17 @@ impl EapInitiator {
             else {
                 return Ok(EapEvent::Failed);
             };
-            let idr = find(&ps, PayloadType::IdResponder).unwrap_or(&[]);
+            // RFC 7296 keys the responder's final AUTH to the IDr it sent in its
+            // *first* message; the final message usually omits it.
+            let idr: Vec<u8> = if self.idr.is_empty() {
+                find(&ps, PayloadType::IdResponder).unwrap_or(&[]).to_vec()
+            } else {
+                self.idr.clone()
+            };
             let msk = mschapv2::derive_msk(&self.password, &self.nt_response);
             let expect = psk_auth(
                 &msk,
-                &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, idr),
+                &responder_signed_octets(&self.sa.resp_message, &self.sa.ni, &self.sa.keys.sk_pr, &idr),
             );
             let got = Authentication::parse(auth_bytes)?;
             return Ok(if got.method == auth_method::SHARED_KEY && got.data == expect {

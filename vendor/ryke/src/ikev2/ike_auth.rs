@@ -311,6 +311,12 @@ pub fn initiator_eap_request(
         (PayloadType::SecurityAssociation, esp_offer(child_spi).to_bytes()),
         (PayloadType::TrafficSelectorInitiator, full_tunnel_ts()),
         (PayloadType::TrafficSelectorResponder, full_tunnel_ts()),
+        // Some responders refuse the CHILD SA with FAILED_CP_REQUIRED unless the
+        // client asks for a virtual IP, so request one.
+        (
+            PayloadType::Configuration,
+            crate::ikev2::payload::Configuration::request_ipv4().to_bytes(),
+        ),
     ];
     let first = first_payload_type(&inner);
     let inner_bytes = encode_payload_chain(&inner);

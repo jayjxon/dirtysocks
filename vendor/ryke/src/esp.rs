@@ -164,6 +164,11 @@ impl ChildSa {
         // AES-GCM-256: 36-byte key material per direction, no separate integ key.
         let keys = derive_child_keys(sk_d, ni, nr, KEY_LEN + SALT_LEN, 0);
         let esp = |spi: u32, material: &[u8]| EspSa::new(spi, material).expect("36-byte child key");
+        // The SPI names the SA at its *receiver*: the SPI we propose (SAi2) is
+        // the one the responder stamps on traffic to us, and the SPI it returns
+        // (SAr2) is what we stamp on traffic to it. This was verified against a
+        // live commercial responder — all four SPI/key pairings were probed and
+        // only this one produces a reply.
         match role {
             Role::Initiator => ChildSa {
                 outbound: esp(peer_spi, &keys.encr_i),

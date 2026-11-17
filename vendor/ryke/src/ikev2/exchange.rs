@@ -216,7 +216,19 @@ pub fn initiator_request(local: &LocalSecret, offer: &SecurityAssociation) -> Ve
     let group = offer_dh_group(offer);
     let public = group.public(&local.dh_private);
     let header = base_header(local.spi, 0, Flags { initiator: true, version: false, response: false });
-    build_sa_init(header, offer, group.transform_id(), &public, &local.nonce, &[])
+    // Force NAT-T (strongSwan's `encap=yes`): advertise NAT-detection hashes that
+    // cannot match, so both ends conclude a NAT is present and ESP is sent
+    // UDP-encapsulated on :4500 instead of as raw IP protocol 50.
+    let nat_source = Notify::status(notify_type::NAT_DETECTION_SOURCE_IP, vec![0xA5; 20]);
+    let nat_dest = Notify::status(notify_type::NAT_DETECTION_DESTINATION_IP, vec![0x5A; 20]);
+    build_sa_init(
+        header,
+        offer,
+        group.transform_id(),
+        &public,
+        &local.nonce,
+        &[nat_source, nat_dest],
+    )
 }
 
 /// A COOKIE challenge policy (RFC 7296 §2.6) — return-routability against
