@@ -186,6 +186,13 @@ impl EapInitiator {
         self.send_certreq = on;
     }
 
+    /// Consume the initiator and hand back the IKE SA state (SPIs + key
+    /// schedule). A client that keeps talking to the peer after the handshake
+    /// — DPD liveness probes, DELETE, rekey — needs it once EAP is done.
+    pub fn into_sa(self) -> CompletedSaInit {
+        self.sa
+    }
+
     /// Authenticate the server from its first response (`SK{ IDr, [CERT,] AUTH,
     /// EAP }`): the leaf must chain to a trusted CA, vouch for the expected
     /// dNSName, and produce a valid RFC 7427 signature over the responder's

@@ -182,6 +182,14 @@ impl Peer {
         }
     }
 
+    /// An IKE re-handshake can move the peer to a different inner address.
+    fn take_new_address(&mut self) -> Option<Ipv4Addr> {
+        match self {
+            Self::Wg(_) => None,
+            Self::Ike(peer) => peer.take_new_address(),
+        }
+    }
+
     async fn poll_device(
         &mut self,
         sleep: Pin<&mut Sleep>,
@@ -522,7 +530,7 @@ impl Server {
         let handle = match socket_rx.recv().await {
             Some(FromWgMsg::Connect(handle)) => handle,
             Some(FromWgMsg::Close) | None => {
-                tracing::trace!(?socket_addr, "iface could not open connection");
+                tracing::debug!(?socket_addr, "iface could not open connection");
                 pipe.stream.shutdown().await?;
                 return Ok(());
             }
@@ -661,6 +669,18 @@ impl IfaceHandler {
                         tracing::warn!(?e, "error polling device");
                     }
                     needs_poll |= self.peer.wants_poll();
+
+                    // A re-handshake may have moved us to a different inner
+                    // address, which the interface has to adopt immediately.
+                    if let Some(addr) = self.peer.take_new_address() {
+                        self.iface.update_ip_addrs(|addrs| {
+                            if let Some(first) = addrs.first_mut() {
+                                *first = IpCidr::new(IpAddress::from(addr), 0);
+                            }
+                        });
+
+                        tracing::info!(%addr, "inner address changed; updating the interface");
+                    }
                 },
 
                 () = Self::wait_for_poll_iface(self.last_iface_poll, self.iface_poll_delay) => {
@@ -674,22 +694,28 @@ impl IfaceHandler {
         self.last_iface_poll = StdInstant::now();
         let smoltcp_now = SmolInstant::from(self.last_iface_poll);
 
-        let delay = {
+        self.iface
+            .poll(smoltcp_now, &mut self.peer, &mut self.socket_set);
+
+        // `poll_sockets` moves client data into a socket *after* the poll that
+        // would have transmitted it, so that data would otherwise wait for an
+        // unrelated packet to wake the interface. Polling again as soon as
+        // something was queued keeps a request from stalling that way.
+        while self.poll_sockets() {
             self.iface
                 .poll(smoltcp_now, &mut self.peer, &mut self.socket_set);
+        }
 
-            self.iface.poll_delay(smoltcp_now, &self.socket_set)
-        };
-
-        self.iface_poll_delay = delay;
-        self.poll_sockets();
+        self.iface_poll_delay = self.iface.poll_delay(smoltcp_now, &self.socket_set);
     }
 
     /// Moves data between the sockets and their clients.
     ///
     /// This never waits on a client: a client that can't keep up must not stall
     /// the interface, which is shared by every connection.
-    fn poll_sockets(&mut self) {
+    /// Returns whether any data was written into a socket, which needs another
+    /// interface poll to actually be transmitted.
+    fn poll_sockets(&mut self) -> bool {
         let Self {
             socket_set,
             sockets_ctx,
@@ -702,6 +728,7 @@ impl IfaceHandler {
 
         closed_sockets.clear();
 
+        let mut progressed = false;
         let now = StdInstant::now();
         closed_sockets.extend(
             udp_last_used
@@ -750,8 +777,10 @@ impl IfaceHandler {
                         };
 
                         match socket.send_slice(&data) {
-                            Ok(sent) if sent == data.len() => {}
+                            Ok(sent) if sent == data.len() => progressed = true,
                             Ok(sent) => {
+                                progressed |= sent > 0;
+
                                 // Push the unsent remainder back to the front so the
                                 // stream order is preserved.
                                 ctx.send_queue
@@ -767,7 +796,15 @@ impl IfaceHandler {
                     }
 
                     match socket.state() {
-                        tcp::State::Closed => closed_sockets.push(handle),
+                        tcp::State::Closed => {
+                            tracing::debug!(
+                                ?handle,
+                                local = ?socket.local_endpoint(),
+                                remote = ?socket.remote_endpoint(),
+                                "closing a socket: reset or timed out"
+                            );
+                            closed_sockets.push(handle);
+                        }
                         tcp::State::CloseWait if !socket.can_recv() => closed_sockets.push(handle),
                         _ => {}
                     }
@@ -807,6 +844,8 @@ impl IfaceHandler {
             udp_last_used.remove(&handle);
             socket_set.remove(handle);
         }
+
+        progressed
     }
 
     fn handle_msg(&mut self, msg: ToWgMsg) {
@@ -834,6 +873,12 @@ impl IfaceHandler {
                 }
 
                 self.next_ephemeral_port = next_ephemeral_port(self.next_ephemeral_port);
+
+                tracing::debug!(
+                    ?addr,
+                    local = ?socket.local_endpoint(),
+                    "tunnel connection opened"
+                );
 
                 let handle = self.socket_set.add(socket);
 
